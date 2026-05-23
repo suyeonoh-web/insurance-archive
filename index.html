@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>보험 고객 아카이브</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", Roboto, sans-serif; }
+  .spin { animation: sp 0.7s linear infinite; } @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+
+<!-- =====================================================================
+  설정: 아래 두 값을 Supabase 프로젝트 값으로 채우세요.
+  Supabase 대시보드 → 좌측 하단 ⚙️ Project Settings → API
+    • Project URL      → SUPABASE_URL (이미 채워둠, 확인만)
+    • anon public key  → SUPABASE_ANON_KEY (여기에 붙여넣기)
+  ===================================================================== -->
+<script>
+  const SUPABASE_URL = "https://kcqifmvkeudwyneiuskb.supabase.co";
+  const SUPABASE_ANON_KEY = "여기에_anon_public_key_붙여넣기";
+</script>
+
+<div id="app"></div>
+
+<!-- 토스트 -->
+<div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 hidden">
+  <div id="toast-box" class="px-4 py-2 rounded-lg shadow-lg text-white text-sm"></div>
+</div>
+
+<!-- 모달 -->
+<div id="modal" class="fixed inset-0 z-40 hidden bg-black/40 flex items-start justify-center overflow-y-auto p-4">
+  <div id="modal-card" class="bg-white rounded-xl shadow-xl w-full max-w-lg my-8"></div>
+</div>
+
+<script>
+/* =========================================================================
+   초기화
+   ========================================================================= */
+let sb = null;
+const ROLE_LABEL = { ADMIN: "시스템 관리자", AGENT: "담당자", VIEWER: "열람전용", AUDITOR: "감사담당자" };
+const CUST_STATUS = ["ACTIVE", "INACTIVE", "DELETED"];
+const CONTRACT_STATUS = ["ACTIVE", "EXPIRED", "CANCELLED", "PENDING"];
+const CUST_STATUS_LABEL = { ACTIVE: "활성", INACTIVE: "비활성", DELETED: "삭제" };
+const CONTRACT_STATUS_LABEL = { ACTIVE: "유지", EXPIRED: "만기", CANCELLED: "해지", PENDING: "대기" };
+const EVENT_LABEL = {
+  LOGIN_SUCCESS: "로그인", LOGOUT: "로그아웃", CUSTOMER_VIEW: "고객 조회",
+  SENSITIVE_FIELD_VIEW: "연락처 열람", CUSTOMER_CREATE: "고객 등록", CUSTOMER_UPDATE: "고객 수정",
+  CUSTOMER_DELETE: "고객 삭제", MEMO_CREATE: "메모 작성", MEMO_UPDATE: "메모 수정",
+  MEMO_DELETE: "메모 삭제", FILE_UPLOAD: "문서 업로드", FILE_DOWNLOAD: "문서 열람",
+};
+const RES_LABEL = { customer: "고객", memo: "메모", file: "문서", user: "직원" };
+const PAGE_SIZE = 20;
+
+const state = {
+  user: null,        // auth user
+  profile: null,     // public.users row (role, name ...)
+  usersById: {},     // 팀원 id → 이름 (메모 작성자 표시용)
+  channel: null,     // 실시간 동기화 채널
+  page: 0,
+  search: "",
+  status: "",
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const isAdmin = () => state.profile?.role === "ADMIN";
+const canEdit = () => ["ADMIN", "AGENT"].includes(state.profile?.role);
+
+function toast(msg, kind = "ok") {
+  const box = $("toast-box");
+  box.textContent = msg;
+  box.className = "px-4 py-2 rounded-lg shadow-lg text-white text-sm " +
+    (kind === "err" ? "bg-red-600" : kind === "warn" ? "bg-amber-600" : "bg-slate-800");
+  $("toast").classList.remove("hidden");
+  clearTimeout(window.__t);
+  window.__t = setTimeout(() => $("toast").classList.add("hidden"), 2800);
+}
+function openModal(html) { $("modal-card").innerHTML = html; $("modal").classList.remove("hidden"); }
+function closeModal() { $("modal").classList.add("hidden"); $("modal-card").innerHTML = ""; }
+$("modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
+
+function fmtDate(v) { return v ? String(v).slice(0, 10) : "—"; }
+function fmtDT(v) { if (!v) return "—"; const d = new Date(v); return d.toLocaleString("ko-KR", { hour12: false }); }
+function maskPhone(p) {
+  if (!p) return "—";
+  const d = String(p).replace(/[^0-9]/g, "");
+  if (d.length < 7) return "•".repeat(d.length);
+  return d.slice(0, 3) + "-****-" + d.slice(-4);
+}
+async function sha256Hex(str) {
+  if (!crypto?.subtle) return null;
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function sha256File(file) {
+  if (!crypto?.subtle) return null;
+  const buf = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function logAudit(event_type, resource_type = null, resource_id = null, extra = null) {
+  try {
+    await sb.from("audit_logs").insert({
+      user_id: state.user.id, event_type, resource_type, resource_id, extra_data: extra,
+    });
+  } catch (e) { /* 감사 로그 실패는 조용히 무시 */ }
+}
+
+/* 파일 업로드 공통 (드래그앤드롭 + 안전한 저장 경로) */
+function fileExt(name) {
+  const m = String(name).toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : "pdf";
+}
+// 저장 경로엔 한글·공백·괄호가 들어가면 안 되므로 영문/숫자로만 구성 (원래 파일명은 따로 보관)
+function safeKey(prefix, file) {
+  return `${prefix}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${fileExt(file.name)}`;
+}
+function dropzoneHTML() {
+  return `
+    <div id="dz" class="border-2 border-dashed border-slate-300 rounded-xl p-7 text-center cursor-pointer hover:border-slate-500 transition">
+      <input id="dz-input" type="file" accept="application/pdf" class="hidden">
+      <p class="text-slate-500 leading-relaxed">여기로 PDF 파일을 끌어다 놓거나<br>눌러서 선택하세요</p>
+      <p id="dz-name" class="text-slate-800 font-medium mt-2 hidden"></p>
+    </div>`;
+}
+function setupDropzone(onSelect) {
+  const dz = $("dz"), input = $("dz-input"), nameEl = $("dz-name");
+  const show = (file) => {
+    if (!file) return;
+    onSelect(file);
+    nameEl.textContent = "선택됨: " + file.name;
+    nameEl.classList.remove("hidden");
+  };
+  dz.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => show(input.files[0]));
+  ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => {
+    e.preventDefault(); dz.classList.add("border-slate-600", "bg-slate-50");
+  }));
+  ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => {
+    e.preventDefault(); dz.classList.remove("border-slate-600", "bg-slate-50");
+  }));
+  dz.addEventListener("drop", (e) => { e.preventDefault(); show(e.dataTransfer.files[0]); });
+}
+
+/* =========================================================================
+   인증
+   ========================================================================= */
+function getConfig() {
+  const url = localStorage.getItem("sb_url") || SUPABASE_URL;
+  const key = localStorage.getItem("sb_key") || (SUPABASE_ANON_KEY.includes("붙여넣기") ? "" : SUPABASE_ANON_KEY);
+  return { url, key };
+}
+
+async function boot() {
+  const { url, key } = getConfig();
+  if (!key) { renderSetup(url); return; }
+  sb = window.supabase.createClient(url, key);
+  try {
+    const { data: { session } } = await sb.auth.getSession();
+    if (session) { state.user = session.user; await loadProfile(); await loadUsersMap(); renderShell(); navigate("customers"); }
+    else renderLogin();
+  } catch (e) { renderSetup(url, "연결 실패: " + e.message); }
+}
+
+function renderSetup(url, msg) {
+  $("app").innerHTML = `
+  <div class="min-h-screen flex items-center justify-center px-4">
+    <div class="bg-white rounded-2xl shadow-lg w-full max-w-md p-8">
+      <div class="text-xl font-bold mb-1">Supabase 연결 설정</div>
+      <p class="text-sm text-slate-500 mb-5">최초 1회만 입력하면 이 브라우저에 저장됩니다.</p>
+      <form id="setup-form" class="space-y-3 text-sm">
+        <label class="block"><span class="text-slate-500">프로젝트 주소</span>
+          <input id="su-url" value="${esc(url)}" class="${inp}"></label>
+        <label class="block"><span class="text-slate-500">공개 키 (anon)</span>
+          <input id="su-key" placeholder="eyJ... 로 시작하는 긴 키" class="${inp}"></label>
+        <button type="submit" class="w-full bg-slate-800 text-white rounded-lg py-2 font-medium hover:bg-slate-700">저장하고 시작</button>
+      </form>
+      ${msg ? `<p class="text-red-600 text-sm mt-3">${esc(msg)}</p>` : ""}
+      <div class="text-xs text-slate-400 mt-4 leading-relaxed">
+        키 찾는 법: Supabase 대시보드 → 좌측 하단 ⚙️ <b>Project Settings</b> → <b>API</b> →
+        <b>anon public</b> 키 복사.<br>(공개돼도 안전한 키예요. service_role 키는 넣지 마세요.)
+      </div>
+    </div>
+  </div>`;
+  $("setup-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const u = $("su-url").value.trim(), k = $("su-key").value.trim();
+    if (!k) return;
+    localStorage.setItem("sb_url", u);
+    localStorage.setItem("sb_key", k);
+    boot();
+  });
+}
+
+async function loadProfile() {
+  const { data } = await sb.from("users").select("*").eq("id", state.user.id).maybeSingle();
+  state.profile = data || { role: "AGENT", name: state.user.email };
+}
+
+async function loadUsersMap() {
+  const { data } = await sb.from("users").select("id,name,email");
+  state.usersById = {};
+  (data || []).forEach((u) => { state.usersById[u.id] = u.name || u.email; });
+}
+function userName(id) { return state.usersById[id] || "직원"; }
+
+// 실시간 동기화: 열어둔 고객의 메모·계약·정보가 바뀌면 조용히 새로고침
+function subscribeCustomer(id) {
+  if (state.channel) { sb.removeChannel(state.channel); state.channel = null; }
+  state.channel = sb.channel("cust-" + id)
+    .on("postgres_changes", { event: "*", schema: "public", table: "memos", filter: "customer_id=eq." + id }, () => loadMemos(id))
+    .on("postgres_changes", { event: "*", schema: "public", table: "contracts", filter: "customer_id=eq." + id }, () => loadContracts(id))
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "customers", filter: "id=eq." + id }, () => viewCustomerDetail(id, { silent: true }))
+    .subscribe();
+}
+function unsubscribeCustomer() {
+  if (state.channel) { sb.removeChannel(state.channel); state.channel = null; }
+}
+
+function renderLogin() {
+  $("app").innerHTML = `
+  <div class="min-h-screen flex items-center justify-center px-4">
+    <div class="bg-white rounded-2xl shadow-lg w-full max-w-sm p-8">
+      <div class="text-center mb-6">
+        <div class="text-2xl font-bold text-slate-800">보험 고객 아카이브</div>
+        <div class="text-sm text-slate-500 mt-1">내부 직원 전용 시스템</div>
+      </div>
+      <form id="login-form" class="space-y-3">
+        <input id="email" type="email" placeholder="이메일" required
+          class="w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-400" />
+        <input id="pw" type="password" placeholder="비밀번호" required
+          class="w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-400" />
+        <button type="submit" id="login-btn"
+          class="w-full bg-slate-800 text-white rounded-lg py-2 font-medium hover:bg-slate-700">로그인</button>
+      </form>
+      <p id="login-err" class="text-red-600 text-sm mt-3 hidden"></p>
+      <button id="reconfig" type="button" class="text-xs text-slate-400 hover:text-slate-600 mt-4 block mx-auto">⚙ 연결 설정 변경</button>
+    </div>
+  </div>`;
+  $("login-form").addEventListener("submit", doLogin);
+  $("reconfig").addEventListener("click", () => {
+    localStorage.removeItem("sb_key"); localStorage.removeItem("sb_url");
+    renderSetup(SUPABASE_URL);
+  });
+}
+
+async function doLogin(e) {
+  e.preventDefault();
+  const btn = $("login-btn"); btn.disabled = true; btn.textContent = "로그인 중…";
+  $("login-err").classList.add("hidden");
+  const { data, error } = await sb.auth.signInWithPassword({ email: $("email").value.trim(), password: $("pw").value });
+  if (error) {
+    $("login-err").textContent = "로그인 실패: " + error.message;
+    $("login-err").classList.remove("hidden");
+    btn.disabled = false; btn.textContent = "로그인";
+    return;
+  }
+  state.user = data.user; await loadProfile(); await loadUsersMap();
+  await logAudit("LOGIN_SUCCESS");
+  renderShell(); navigate("customers");
+}
+
+async function doLogout() {
+  await logAudit("LOGOUT");
+  unsubscribeCustomer();
+  await sb.auth.signOut();
+  state.user = null; state.profile = null;
+  renderLogin();
+}
+
+/* =========================================================================
+   앱 셸 / 라우팅
+   ========================================================================= */
+function renderShell() {
+  const p = state.profile;
+  const auditNav = ["ADMIN", "AUDITOR"].includes(p.role)
+    ? `<button data-nav="audit" class="nav-btn px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100">감사 로그</button>` : "";
+  $("app").innerHTML = `
+  <div class="min-h-screen flex flex-col">
+    <header class="bg-white border-b">
+      <div class="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
+        <div class="flex items-center gap-1">
+          <span class="font-bold text-slate-800 mr-4">보험 고객 아카이브</span>
+          <button data-nav="customers" class="nav-btn px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100">고객</button>
+          <button data-nav="files" class="nav-btn px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100">약관 PDF</button>
+          ${auditNav}
+        </div>
+        <div class="flex items-center gap-3 text-sm">
+          <span class="text-slate-600">${esc(p.name || state.user.email)}
+            <span class="ml-1 px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 text-xs">${ROLE_LABEL[p.role] || p.role}</span></span>
+          <button id="logout-btn" class="text-slate-500 hover:text-red-600">로그아웃</button>
+        </div>
+      </div>
+    </header>
+    <main id="view" class="flex-1 max-w-6xl w-full mx-auto px-4 py-6"></main>
+  </div>`;
+  document.querySelectorAll(".nav-btn").forEach((b) =>
+    b.addEventListener("click", () => navigate(b.dataset.nav)));
+  $("logout-btn").addEventListener("click", doLogout);
+}
+
+function setActiveNav(name) {
+  document.querySelectorAll(".nav-btn").forEach((b) => {
+    const on = b.dataset.nav === name;
+    b.classList.toggle("bg-slate-800", on); b.classList.toggle("text-white", on);
+    b.classList.toggle("text-slate-600", !on);
+  });
+}
+
+function navigate(name, arg) {
+  unsubscribeCustomer();
+  setActiveNav(name);
+  if (name === "customers") viewCustomers();
+  else if (name === "files") viewFiles();
+  else if (name === "audit") viewAuditLogs();
+  else if (name === "customerDetail") viewCustomerDetail(arg);
+}
+
+/* =========================================================================
+   고객 목록
+   ========================================================================= */
+async function viewCustomers() {
+  const v = $("view");
+  v.innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-xl font-bold">고객 목록</h1>
+      ${canEdit() ? `<button id="new-cust" class="bg-slate-800 text-white text-sm px-4 py-2 rounded-lg hover:bg-slate-700">+ 고객 등록</button>` : ""}
+    </div>
+    <div class="flex flex-wrap gap-2 mb-4">
+      <input id="q" value="${esc(state.search)}" placeholder="이름 검색"
+        class="border rounded-lg px-3 py-2 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+      <select id="st" class="border rounded-lg px-3 py-2 text-sm">
+        <option value="">상태 전체</option>
+        ${CUST_STATUS.map((s) => `<option value="${s}" ${state.status === s ? "selected" : ""}>${CUST_STATUS_LABEL[s] || s}</option>`).join("")}
+      </select>
+      <button id="search-btn" class="bg-slate-200 text-sm px-4 py-2 rounded-lg hover:bg-slate-300">검색</button>
+    </div>
+    <div id="cust-list" class="bg-white rounded-xl shadow-sm overflow-hidden">
+      <div class="p-8 text-center text-slate-400"><span class="inline-block w-5 h-5 border-2 border-slate-300 border-t-slate-600 rounded-full spin"></span></div>
+    </div>`;
+  if (canEdit()) $("new-cust").addEventListener("click", () => openCustomerForm("new"));
+  const doSearch = () => { state.search = $("q").value.trim(); state.status = $("st").value; state.page = 0; loadCustomers(); };
+  $("search-btn").addEventListener("click", doSearch);
+  $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  loadCustomers();
+}
+
+async function loadCustomers() {
+  const from = state.page * PAGE_SIZE, to = from + PAGE_SIZE - 1;
+  let query = sb.from("customers").select("id,name,phone,email,status,assigned_agent_id,created_at", { count: "exact" })
+    .is("deleted_at", null).order("created_at", { ascending: false }).range(from, to);
+  if (state.search) query = query.ilike("name", `%${state.search}%`);
+  if (state.status) query = query.eq("status", state.status);
+  const { data, count, error } = await query;
+  const box = $("cust-list");
+  if (error) { box.innerHTML = `<div class="p-6 text-red-600 text-sm">오류: ${esc(error.message)}</div>`; return; }
+  if (!data.length) { box.innerHTML = `<div class="p-10 text-center text-slate-400">고객이 없습니다.</div>`; return; }
+  box.innerHTML = `
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-left">
+        <tr><th class="px-4 py-3 font-medium">이름</th><th class="px-4 py-3 font-medium">연락처</th>
+        <th class="px-4 py-3 font-medium">이메일</th><th class="px-4 py-3 font-medium">상태</th>
+        <th class="px-4 py-3 font-medium">등록일</th></tr>
+      </thead>
+      <tbody>
+        ${data.map((c) => `
+          <tr class="border-t hover:bg-slate-50 cursor-pointer" data-id="${c.id}">
+            <td class="px-4 py-3 font-medium text-slate-800">${esc(c.name)}</td>
+            <td class="px-4 py-3 text-slate-600">${maskPhone(c.phone)}</td>
+            <td class="px-4 py-3 text-slate-600">${esc(c.email || "—")}</td>
+            <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-xs ${c.status === "ACTIVE" ? "bg-green-100 text-green-700" : "bg-slate-200 text-slate-600"}">${CUST_STATUS_LABEL[c.status] || c.status}</span></td>
+            <td class="px-4 py-3 text-slate-500">${fmtDate(c.created_at)}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>
+    <div class="flex items-center justify-between px-4 py-3 border-t text-sm text-slate-500">
+      <span>총 ${count ?? 0}명</span>
+      <span class="flex gap-2">
+        <button id="prev" class="px-3 py-1 rounded border ${state.page === 0 ? "opacity-40 cursor-not-allowed" : "hover:bg-slate-100"}">이전</button>
+        <span class="px-2 py-1">${state.page + 1} 페이지</span>
+        <button id="next" class="px-3 py-1 rounded border ${to + 1 >= (count ?? 0) ? "opacity-40 cursor-not-allowed" : "hover:bg-slate-100"}">다음</button>
+      </span>
+    </div>`;
+  box.querySelectorAll("tr[data-id]").forEach((tr) =>
+    tr.addEventListener("click", () => navigate("customerDetail", tr.dataset.id)));
+  $("prev").addEventListener("click", () => { if (state.page > 0) { state.page--; loadCustomers(); } });
+  $("next").addEventListener("click", () => { if (to + 1 < (count ?? 0)) { state.page++; loadCustomers(); } });
+}
+
+/* =========================================================================
+   고객 상세
+   ========================================================================= */
+async function viewCustomerDetail(id, opts = {}) {
+  const v = $("view");
+  if (!opts.silent) v.innerHTML = `<div class="p-8 text-center text-slate-400"><span class="inline-block w-5 h-5 border-2 border-slate-300 border-t-slate-600 rounded-full spin"></span></div>`;
+  const { data: c, error } = await sb.from("customers").select("*").eq("id", id).maybeSingle();
+  if (error || !c) { v.innerHTML = `<p class="text-red-600">고객을 찾을 수 없습니다.</p>`; return; }
+  if (!opts.silent) await logAudit("CUSTOMER_VIEW", "customer", id);
+
+  v.innerHTML = `
+    <button id="back" class="text-sm text-slate-500 hover:text-slate-800 mb-3">← 목록으로</button>
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-xl font-bold">${esc(c.name)}</h1>
+      <div class="flex gap-2">
+        ${canEdit() ? `<button id="edit-cust" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">수정</button>` : ""}
+        ${isAdmin() ? `<button id="del-cust" class="text-sm px-3 py-1.5 rounded-lg border border-red-200 text-red-600 hover:bg-red-50">삭제</button>` : ""}
+      </div>
+    </div>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="bg-white rounded-xl shadow-sm p-5">
+        <h2 class="font-semibold mb-3 text-slate-700">기본 정보</h2>
+        <dl class="text-sm space-y-2">
+          ${row("연락처", `<span id="phone-mask">${maskPhone(c.phone)}</span> <button id="reveal" class="text-xs text-blue-600 ml-1">보기</button>`)}
+          ${row("이메일", esc(c.email || "—"))}
+          ${row("생년월일", fmtDate(c.birth_date))}
+          ${row("주소", esc(c.address || "—"))}
+          ${row("주민번호", c.ssn_hash ? "🔒 등록됨 (해시 저장, 원본 미보관)" : "미등록")}
+          ${row("상태", CUST_STATUS_LABEL[c.status] || c.status)}
+        </dl>
+      </div>
+      <div class="bg-white rounded-xl shadow-sm p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold text-slate-700">계약</h2>
+          ${canEdit() ? `<button id="add-contract" class="text-xs px-2 py-1 rounded border hover:bg-slate-50">+ 계약 추가</button>` : ""}
+        </div>
+        <div id="contracts" class="text-sm text-slate-400">불러오는 중…</div>
+      </div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-5 mt-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-slate-700">메모</h2>
+        ${canEdit() ? `<button id="add-memo" class="text-xs px-2 py-1 rounded border hover:bg-slate-50">+ 메모 작성</button>` : ""}
+      </div>
+      <div id="memos" class="text-sm text-slate-400">불러오는 중…</div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-5 mt-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-slate-700">고객 문서 (PDF)</h2>
+        ${canEdit() ? `<button id="add-cfile" class="text-xs px-2 py-1 rounded border hover:bg-slate-50">+ PDF 업로드</button>` : ""}
+      </div>
+      <div id="cfiles" class="text-sm text-slate-400">불러오는 중…</div>
+    </div>`;
+
+  $("back").addEventListener("click", () => navigate("customers"));
+  $("reveal").addEventListener("click", async () => {
+    $("phone-mask").textContent = c.phone || "—";
+    $("reveal").remove();
+    await logAudit("SENSITIVE_FIELD_VIEW", "customer", id, { field: "phone" });
+  });
+  if (canEdit()) {
+    $("edit-cust").addEventListener("click", () => openCustomerForm("edit", c));
+    $("add-contract").addEventListener("click", () => openContractForm(id));
+    $("add-memo").addEventListener("click", () => openMemoForm(id));
+    $("add-cfile").addEventListener("click", () => openCustomerFileForm(id));
+  }
+  if (isAdmin()) $("del-cust").addEventListener("click", () => softDeleteCustomer(c));
+  loadContracts(id);
+  loadMemos(id);
+  loadCustomerFiles(id);
+  if (!opts.silent) subscribeCustomer(id);
+}
+function row(label, val) {
+  return `<div class="flex"><dt class="w-24 text-slate-400 shrink-0">${label}</dt><dd class="text-slate-700">${val}</dd></div>`;
+}
+
+async function loadContracts(cid) {
+  const { data } = await sb.from("contracts").select("*").eq("customer_id", cid).order("created_at", { ascending: false });
+  const box = $("contracts");
+  if (!data || !data.length) { box.innerHTML = `<p class="text-slate-400">계약이 없습니다.</p>`; return; }
+  box.innerHTML = data.map((c) => `
+    <div class="border rounded-lg p-3 mb-2">
+      <div class="flex justify-between"><span class="font-medium">${esc(c.product_name)}</span>
+        <span class="text-xs px-2 py-0.5 rounded-full ${c.status === "ACTIVE" ? "bg-green-100 text-green-700" : "bg-slate-200 text-slate-600"}">${CONTRACT_STATUS_LABEL[c.status] || c.status}</span></div>
+      <div class="text-xs text-slate-500 mt-1">계약번호 ${esc(c.contract_no)} · 보험료 ${c.premium ? Number(c.premium).toLocaleString() + "원" : "—"}</div>
+      <div class="text-xs text-slate-500">${fmtDate(c.start_date)} ~ ${fmtDate(c.end_date)}</div>
+    </div>`).join("");
+}
+
+async function loadMemos(cid) {
+  const { data } = await sb.from("memos").select("*").is("deleted_at", null)
+    .eq("customer_id", cid).order("created_at", { ascending: false });
+  const box = $("memos");
+  if (!data || !data.length) { box.innerHTML = `<p class="text-slate-400">메모가 없습니다.</p>`; return; }
+  box.innerHTML = data.map((m) => {
+    const mine = m.author_id === state.user.id;
+    return `<div class="border-l-2 ${mine ? "border-slate-700" : "border-slate-200"} pl-3 py-2 mb-2">
+      <div class="text-slate-700 whitespace-pre-wrap">${esc(m.content)}</div>
+      <div class="text-xs text-slate-400 mt-1 flex items-center gap-2">
+        <span>${mine ? (state.profile.name || "나") : userName(m.author_id)} · ${fmtDT(m.created_at)}${m.updated_at !== m.created_at ? " (수정됨)" : ""}</span>
+        ${mine ? `<button class="memo-edit text-blue-600" data-id="${m.id}">수정</button>
+                  <button class="memo-del text-red-500" data-id="${m.id}">삭제</button>` : ""}
+      </div></div>`;
+  }).join("");
+  box.querySelectorAll(".memo-edit").forEach((b) =>
+    b.addEventListener("click", () => { const m = data.find((x) => x.id === b.dataset.id); openMemoForm(cid, m); }));
+  box.querySelectorAll(".memo-del").forEach((b) =>
+    b.addEventListener("click", () => deleteMemo(b.dataset.id, cid)));
+}
+
+/* =========================================================================
+   고객 등록/수정
+   ========================================================================= */
+async function openCustomerForm(mode, c = {}) {
+  let agentOptions = "";
+  if (isAdmin()) {
+    const { data: users } = await sb.from("users").select("id,name,email").is("deleted_at", null);
+    agentOptions = (users || []).map((u) =>
+      `<option value="${u.id}" ${c.assigned_agent_id === u.id ? "selected" : ""}>${esc(u.name || u.email)}</option>`).join("");
+  }
+  openModal(`
+    <form id="cust-form" class="p-6">
+      <h2 class="text-lg font-bold mb-4">${mode === "new" ? "고객 등록" : "고객 수정"}</h2>
+      <div class="space-y-3 text-sm">
+        ${field("이름*", `<input name="name" required value="${esc(c.name || "")}" class="${inp}">`)}
+        ${field("연락처*", `<input name="phone" required value="${esc(c.phone || "")}" placeholder="010-0000-0000" class="${inp}">`)}
+        ${field("주민번호", `<input name="ssn" value="" placeholder="${c.ssn_hash ? "등록됨 (변경 시에만 입력)" : "중복확인용·해시 저장"}" class="${inp}">`)}
+        ${field("생년월일", dateField("birth_date", c.birth_date || ""))}
+        ${field("이메일", `<input name="email" type="email" value="${esc(c.email || "")}" class="${inp}">`)}
+        ${field("주소", `<input name="address" value="${esc(c.address || "")}" class="${inp}">`)}
+        ${field("상태", `<select name="status" class="${inp}">${CUST_STATUS.map((s) => `<option value="${s}" ${c.status === s ? "selected" : ""}>${CUST_STATUS_LABEL[s] || s}</option>`).join("")}</select>`)}
+        ${isAdmin() ? field("담당자", `<select name="agent" class="${inp}">${agentOptions}</select>`) : ""}
+      </div>
+      <p id="cf-err" class="text-red-600 text-sm mt-3 hidden"></p>
+      <div class="flex justify-end gap-2 mt-5">
+        <button type="button" id="cf-cancel" class="px-4 py-2 rounded-lg border text-sm hover:bg-slate-50">취소</button>
+        <button type="submit" id="cf-save" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700">저장</button>
+      </div>
+    </form>`);
+  $("cf-cancel").addEventListener("click", closeModal);
+  wireDateFields($("cust-form"));
+  $("cust-form").addEventListener("submit", (e) => saveCustomer(e, mode, c));
+}
+const inp = "w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300";
+const dinp = "border rounded-lg px-2 py-2 text-center focus:outline-none focus:ring-2 focus:ring-slate-300";
+function field(label, control) {
+  return `<label class="block"><span class="text-slate-500">${label}</span>${control}</label>`;
+}
+
+// 년/월/일 분리 입력 — 채우면 자동으로 다음 칸으로 이동
+function dateField(name, value) {
+  const p = value ? String(value).split("-") : ["", "", ""];
+  return `<div class="flex gap-2" data-datefield="${name}">
+    <input data-part="y" maxlength="4" inputmode="numeric" value="${p[0] || ""}" placeholder="년" class="${dinp} w-24">
+    <input data-part="m" maxlength="2" inputmode="numeric" value="${p[1] || ""}" placeholder="월" class="${dinp} w-16">
+    <input data-part="d" maxlength="2" inputmode="numeric" value="${p[2] || ""}" placeholder="일" class="${dinp} w-16">
+  </div>`;
+}
+function wireDateFields(container) {
+  container.querySelectorAll("[data-datefield]").forEach((g) => {
+    const y = g.querySelector('[data-part="y"]'), m = g.querySelector('[data-part="m"]'), d = g.querySelector('[data-part="d"]');
+    [y, m, d].forEach((el) => el.addEventListener("input", () => { el.value = el.value.replace(/[^0-9]/g, ""); }));
+    y.addEventListener("input", () => { if (y.value.length >= 4) m.focus(); });
+    m.addEventListener("input", () => { if (m.value.length >= 2) d.focus(); });
+    m.addEventListener("keydown", (e) => { if (e.key === "Backspace" && !m.value) y.focus(); });
+    d.addEventListener("keydown", (e) => { if (e.key === "Backspace" && !d.value) m.focus(); });
+  });
+}
+function readDate(form, name) {
+  const g = form.querySelector(`[data-datefield="${name}"]`);
+  if (!g) return null;
+  const y = g.querySelector('[data-part="y"]').value.trim();
+  const m = g.querySelector('[data-part="m"]').value.trim();
+  const d = g.querySelector('[data-part="d"]').value.trim();
+  if (!y || !m || !d) return null;
+  return `${y.padStart(4, "0")}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+}
+
+async function saveCustomer(e, mode, old) {
+  e.preventDefault();
+  const f = e.target;
+  const btn = $("cf-save"); btn.disabled = true; btn.textContent = "저장 중…";
+  const err = (m) => { $("cf-err").textContent = m; $("cf-err").classList.remove("hidden"); btn.disabled = false; btn.textContent = "저장"; };
+
+  const payload = {
+    name: f.name.value.trim(),
+    phone: f.phone.value.trim(),
+    birth_date: readDate(f, "birth_date"),
+    email: f.email.value.trim() || null,
+    address: f.address.value.trim() || null,
+    status: f.status.value,
+  };
+  if (isAdmin() && f.agent) payload.assigned_agent_id = f.agent.value;
+  if (!isAdmin()) payload.assigned_agent_id = state.user.id; // 담당자는 본인에게 배정
+
+  const ssnRaw = f.ssn.value.trim();
+  if (ssnRaw) {
+    const h = await sha256Hex(ssnRaw.replace(/[^0-9]/g, ""));
+    if (h) {
+      payload.ssn_hash = h;
+      // 중복 주민번호 검출
+      let dup = sb.from("customers").select("id").eq("ssn_hash", h).is("deleted_at", null);
+      if (mode === "edit") dup = dup.neq("id", old.id);
+      const { data: dd } = await dup;
+      if (dd && dd.length) return err("이미 등록된 주민번호입니다.");
+    }
+  }
+
+  try {
+    if (mode === "new") {
+      const { data, error } = await sb.from("customers").insert(payload).select("id").single();
+      if (error) throw error;
+      await logAudit("CUSTOMER_CREATE", "customer", data.id);
+      closeModal(); toast("고객이 등록되었습니다."); navigate("customerDetail", data.id);
+    } else {
+      const { error } = await sb.from("customers").update(payload).eq("id", old.id);
+      if (error) throw error;
+      // 변경 이력 기록
+      const diff = {};
+      ["name", "phone", "email", "address", "status", "birth_date"].forEach((k) => {
+        if ((old[k] ?? null) !== (payload[k] ?? null)) diff[k] = { from: old[k] ?? null, to: payload[k] ?? null };
+      });
+      if (Object.keys(diff).length)
+        await sb.from("customer_history").insert({ customer_id: old.id, changed_by: state.user.id, diff_json: diff });
+      await logAudit("CUSTOMER_UPDATE", "customer", old.id, diff);
+      closeModal(); toast("수정되었습니다."); navigate("customerDetail", old.id);
+    }
+  } catch (e2) { err("저장 실패: " + e2.message); }
+}
+
+async function softDeleteCustomer(c) {
+  const reason = prompt(`'${c.name}' 고객을 삭제합니다.\n삭제 사유를 입력하세요 (필수):`);
+  if (!reason) return;
+  const { error } = await sb.from("customers").update({ status: "DELETED", deleted_at: new Date().toISOString() }).eq("id", c.id);
+  if (error) { toast("삭제 실패: " + error.message, "err"); return; }
+  await logAudit("CUSTOMER_DELETE", "customer", c.id, { reason });
+  toast("삭제(논리)되었습니다."); navigate("customers");
+}
+
+/* =========================================================================
+   계약 추가
+   ========================================================================= */
+function openContractForm(cid) {
+  openModal(`
+    <form id="ct-form" class="p-6">
+      <h2 class="text-lg font-bold mb-4">계약 추가</h2>
+      <div class="space-y-3 text-sm">
+        ${field("계약번호*", `<input name="contract_no" required class="${inp}">`)}
+        ${field("상품명*", `<input name="product_name" required class="${inp}">`)}
+        ${field("상품코드", `<input name="product_code" class="${inp}">`)}
+        ${field("보험료(원)", `<input name="premium" type="number" step="0.01" class="${inp}">`)}
+        ${field("상태", `<select name="status" class="${inp}">${CONTRACT_STATUS.map((s) => `<option value="${s}">${CONTRACT_STATUS_LABEL[s] || s}</option>`).join("")}</select>`)}
+        ${field("시작일*", dateField("start_date", ""))}
+        ${field("종료일", dateField("end_date", ""))}
+      </div>
+      <p id="ct-err" class="text-red-600 text-sm mt-3 hidden"></p>
+      <div class="flex justify-end gap-2 mt-5">
+        <button type="button" id="ct-cancel" class="px-4 py-2 rounded-lg border text-sm hover:bg-slate-50">취소</button>
+        <button type="submit" id="ct-save" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700">저장</button>
+      </div>
+    </form>`);
+  $("ct-cancel").addEventListener("click", closeModal);
+  wireDateFields($("ct-form"));
+  $("ct-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target, btn = $("ct-save");
+    const start = readDate(f, "start_date");
+    if (!start) { $("ct-err").textContent = "시작일을 입력하세요 (년/월/일)."; $("ct-err").classList.remove("hidden"); return; }
+    btn.disabled = true; btn.textContent = "저장 중…";
+    const { error } = await sb.from("contracts").insert({
+      customer_id: cid, contract_no: f.contract_no.value.trim(), product_name: f.product_name.value.trim(),
+      product_code: f.product_code.value.trim() || null, premium: f.premium.value || null,
+      status: f.status.value, start_date: start, end_date: readDate(f, "end_date"),
+    });
+    if (error) { $("ct-err").textContent = "저장 실패: " + error.message; $("ct-err").classList.remove("hidden"); btn.disabled = false; btn.textContent = "저장"; return; }
+    closeModal(); toast("계약이 추가되었습니다."); loadContracts(cid);
+  });
+}
+
+/* =========================================================================
+   메모
+   ========================================================================= */
+function openMemoForm(cid, memo = null) {
+  openModal(`
+    <form id="mm-form" class="p-6">
+      <h2 class="text-lg font-bold mb-4">${memo ? "메모 수정" : "메모 작성"}</h2>
+      <textarea name="content" required maxlength="2000" rows="5"
+        class="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300"
+        placeholder="최대 2,000자">${esc(memo?.content || "")}</textarea>
+      <p id="mm-err" class="text-red-600 text-sm mt-2 hidden"></p>
+      <div class="flex justify-end gap-2 mt-4">
+        <button type="button" id="mm-cancel" class="px-4 py-2 rounded-lg border text-sm hover:bg-slate-50">취소</button>
+        <button type="submit" id="mm-save" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700">저장</button>
+      </div>
+    </form>`);
+  $("mm-cancel").addEventListener("click", closeModal);
+  $("mm-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const content = e.target.content.value.trim();
+    if (!content) return;
+    const btn = $("mm-save"); btn.disabled = true; btn.textContent = "저장 중…";
+    let error;
+    if (memo) {
+      ({ error } = await sb.from("memos").update({ content }).eq("id", memo.id));
+    } else {
+      ({ error } = await sb.from("memos").insert({ customer_id: cid, author_id: state.user.id, content }));
+    }
+    if (error) { $("mm-err").textContent = "저장 실패: " + error.message; $("mm-err").classList.remove("hidden"); btn.disabled = false; btn.textContent = "저장"; return; }
+    await logAudit(memo ? "MEMO_UPDATE" : "MEMO_CREATE", "memo", memo?.id || null, { customer_id: cid });
+    closeModal(); toast("저장되었습니다."); loadMemos(cid);
+  });
+}
+
+async function deleteMemo(id, cid) {
+  if (!confirm("이 메모를 삭제할까요?")) return;
+  const { error } = await sb.from("memos").update({ deleted_at: new Date().toISOString() }).eq("id", id);
+  if (error) { toast("삭제 실패: " + error.message, "err"); return; }
+  await logAudit("MEMO_DELETE", "memo", id, { customer_id: cid });
+  toast("삭제되었습니다."); loadMemos(cid);
+}
+
+/* =========================================================================
+   약관 PDF (Supabase Storage)
+   ========================================================================= */
+async function viewFiles() {
+  const v = $("view");
+  v.innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-xl font-bold">약관 PDF</h1>
+      ${isAdmin() ? `<button id="upload-pdf" class="bg-slate-800 text-white text-sm px-4 py-2 rounded-lg hover:bg-slate-700">+ PDF 업로드</button>` : ""}
+    </div>
+    <div id="file-list" class="bg-white rounded-xl shadow-sm overflow-hidden">
+      <div class="p-8 text-center text-slate-400"><span class="inline-block w-5 h-5 border-2 border-slate-300 border-t-slate-600 rounded-full spin"></span></div>
+    </div>`;
+  if (isAdmin()) $("upload-pdf").addEventListener("click", openUploadForm);
+  loadFiles();
+}
+
+async function loadFiles() {
+  const { data, error } = await sb.from("files").select("*").is("customer_id", null).is("deleted_at", null).order("created_at", { ascending: false });
+  const box = $("file-list");
+  if (error) { box.innerHTML = `<div class="p-6 text-red-600 text-sm">오류: ${esc(error.message)}</div>`; return; }
+  if (!data.length) { box.innerHTML = `<div class="p-10 text-center text-slate-400">등록된 약관이 없습니다.</div>`; return; }
+  box.innerHTML = `<table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-left">
+      <tr><th class="px-4 py-3 font-medium">상품코드</th><th class="px-4 py-3 font-medium">버전</th>
+      <th class="px-4 py-3 font-medium">파일명</th><th class="px-4 py-3 font-medium">크기</th>
+      <th class="px-4 py-3 font-medium">등록일</th><th class="px-4 py-3"></th></tr>
+    </thead><tbody>
+    ${data.map((f) => `<tr class="border-t hover:bg-slate-50">
+      <td class="px-4 py-3 font-medium">${esc(f.product_code)}</td>
+      <td class="px-4 py-3">${esc(f.version)}</td>
+      <td class="px-4 py-3 text-slate-600">${esc(f.filename)}</td>
+      <td class="px-4 py-3 text-slate-500">${f.file_size ? (f.file_size / 1024 / 1024).toFixed(2) + " MB" : "—"}</td>
+      <td class="px-4 py-3 text-slate-500">${fmtDate(f.created_at)}</td>
+      <td class="px-4 py-3 text-right">
+        <button class="view-pdf text-blue-600" data-key="${esc(f.storage_key)}" data-id="${f.id}">열기</button>
+        ${isAdmin() ? `<button class="del-pdf text-red-500 ml-3" data-id="${f.id}" data-key="${esc(f.storage_key)}">삭제</button>` : ""}
+      </td></tr>`).join("")}
+    </tbody></table>`;
+  box.querySelectorAll(".view-pdf").forEach((b) => b.addEventListener("click", () => viewPdf(b.dataset.key, b.dataset.id)));
+  box.querySelectorAll(".del-pdf").forEach((b) => b.addEventListener("click", () => deletePdf(b.dataset.id, b.dataset.key)));
+}
+
+async function viewPdf(key, id) {
+  const { data, error } = await sb.storage.from("insurance-pdfs").createSignedUrl(key, 3600);
+  if (error) { toast("열기 실패: " + error.message, "err"); return; }
+  await logAudit("FILE_DOWNLOAD", "file", id);
+  window.open(data.signedUrl, "_blank");
+}
+
+async function deletePdf(id, key, reload) {
+  if (!confirm("이 PDF를 삭제할까요?")) return;
+  await sb.storage.from("insurance-pdfs").remove([key]);
+  await sb.from("files").update({ deleted_at: new Date().toISOString(), is_current: false }).eq("id", id);
+  toast("삭제되었습니다."); (reload || loadFiles)();
+}
+
+function openUploadForm() {
+  openModal(`
+    <form id="up-form" class="p-6">
+      <h2 class="text-lg font-bold mb-4">약관 PDF 업로드</h2>
+      <div class="space-y-3 text-sm mb-3">
+        ${field("상품코드*", `<input name="product_code" required class="${inp}">`)}
+        ${field("버전*", `<input name="version" required placeholder="예: 1.0" class="${inp}">`)}
+      </div>
+      ${dropzoneHTML()}
+      <p id="up-err" class="text-red-600 text-sm mt-3 hidden"></p>
+      <div class="flex justify-end gap-2 mt-5">
+        <button type="button" id="up-cancel" class="px-4 py-2 rounded-lg border text-sm hover:bg-slate-50">취소</button>
+        <button type="submit" id="up-save" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700">업로드</button>
+      </div>
+    </form>`);
+  let chosen = null;
+  setupDropzone((file) => { chosen = file; });
+  $("up-cancel").addEventListener("click", closeModal);
+  $("up-form").addEventListener("submit", (e) => uploadFile(e, () => chosen));
+}
+
+async function uploadFile(e, getFile) {
+  e.preventDefault();
+  const f = e.target, btn = $("up-save");
+  const err = (m) => { $("up-err").textContent = m; $("up-err").classList.remove("hidden"); btn.disabled = false; btn.textContent = "업로드"; };
+  const file = getFile();
+  if (!file) return err("PDF 파일을 선택하세요.");
+  if (file.type !== "application/pdf") return err("PDF 파일만 업로드할 수 있습니다.");
+  if (file.size > 50 * 1024 * 1024) return err("50MB 이하만 가능합니다.");
+  const code = f.product_code.value.trim(), ver = f.version.value.trim();
+  if (!code || !ver) return err("상품코드와 버전을 입력하세요.");
+  btn.disabled = true; btn.textContent = "업로드 중…";
+
+  const key = safeKey("product", file);
+  const { error: upErr } = await sb.storage.from("insurance-pdfs").upload(key, file, { contentType: "application/pdf" });
+  if (upErr) return err("업로드 실패: " + upErr.message);
+
+  const checksum = await sha256File(file);
+  const { data, error } = await sb.from("files").insert({
+    product_code: code, version: ver, filename: file.name, storage_key: key,
+    checksum: checksum || "", file_size: file.size, uploaded_by: state.user.id, mime_type: "application/pdf",
+  }).select("id").single();
+  if (error) { await sb.storage.from("insurance-pdfs").remove([key]); return err("정보 저장 실패: " + error.message); }
+  await logAudit("FILE_UPLOAD", "file", data.id, { filename: file.name });
+  closeModal(); toast("업로드되었습니다."); loadFiles();
+}
+
+/* =========================================================================
+   고객별 문서 (PDF)
+   ========================================================================= */
+async function loadCustomerFiles(cid) {
+  const { data, error } = await sb.from("files").select("*").eq("customer_id", cid)
+    .is("deleted_at", null).order("created_at", { ascending: false });
+  const box = $("cfiles");
+  if (error) { box.innerHTML = `<p class="text-red-600">${esc(error.message)}</p>`; return; }
+  if (!data.length) { box.innerHTML = `<p class="text-slate-400">등록된 문서가 없습니다.</p>`; return; }
+  box.innerHTML = data.map((f) => `
+    <div class="flex items-center justify-between border rounded-lg p-2 mb-2">
+      <div class="min-w-0">
+        <span class="text-slate-700">${esc(f.filename)}</span>
+        <span class="text-xs text-slate-400 ml-2">${f.file_size ? (f.file_size / 1024 / 1024).toFixed(2) + " MB" : ""} · ${fmtDate(f.created_at)}</span>
+      </div>
+      <div class="text-sm shrink-0">
+        <button class="cf-view text-blue-600" data-key="${esc(f.storage_key)}" data-id="${f.id}">열기</button>
+        ${canEdit() ? `<button class="cf-del text-red-500 ml-3" data-id="${f.id}" data-key="${esc(f.storage_key)}">삭제</button>` : ""}
+      </div>
+    </div>`).join("");
+  box.querySelectorAll(".cf-view").forEach((b) => b.addEventListener("click", () => viewPdf(b.dataset.key, b.dataset.id)));
+  box.querySelectorAll(".cf-del").forEach((b) => b.addEventListener("click", () => deletePdf(b.dataset.id, b.dataset.key, () => loadCustomerFiles(cid))));
+}
+
+function openCustomerFileForm(cid) {
+  openModal(`
+    <form id="cfile-form" class="p-6">
+      <h2 class="text-lg font-bold mb-4">고객 문서 업로드</h2>
+      ${dropzoneHTML()}
+      <p id="cfile-err" class="text-red-600 text-sm mt-3 hidden"></p>
+      <div class="flex justify-end gap-2 mt-5">
+        <button type="button" id="cfile-cancel" class="px-4 py-2 rounded-lg border text-sm hover:bg-slate-50">취소</button>
+        <button type="submit" id="cfile-save" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700">업로드</button>
+      </div>
+    </form>`);
+  let chosen = null;
+  setupDropzone((file) => { chosen = file; });
+  $("cfile-cancel").addEventListener("click", closeModal);
+  $("cfile-form").addEventListener("submit", (e) => uploadCustomerFile(e, cid, () => chosen));
+}
+
+async function uploadCustomerFile(e, cid, getFile) {
+  e.preventDefault();
+  const btn = $("cfile-save");
+  const err = (m) => { $("cfile-err").textContent = m; $("cfile-err").classList.remove("hidden"); btn.disabled = false; btn.textContent = "업로드"; };
+  const file = getFile();
+  if (!file) return err("PDF 파일을 선택하세요.");
+  if (file.type !== "application/pdf") return err("PDF 파일만 업로드할 수 있습니다.");
+  if (file.size > 50 * 1024 * 1024) return err("50MB 이하만 가능합니다.");
+  btn.disabled = true; btn.textContent = "업로드 중…";
+  const key = safeKey(`customer/${cid}`, file);
+  const { error: upErr } = await sb.storage.from("insurance-pdfs").upload(key, file, { contentType: "application/pdf" });
+  if (upErr) return err("업로드 실패: " + upErr.message);
+  const checksum = await sha256File(file);
+  const { data, error } = await sb.from("files").insert({
+    customer_id: cid, filename: file.name, storage_key: key,
+    checksum: checksum || "", file_size: file.size, uploaded_by: state.user.id, mime_type: "application/pdf",
+  }).select("id").single();
+  if (error) { await sb.storage.from("insurance-pdfs").remove([key]); return err("정보 저장 실패: " + error.message); }
+  await logAudit("FILE_UPLOAD", "file", data.id, { filename: file.name, customer_id: cid });
+  closeModal(); toast("업로드되었습니다."); loadCustomerFiles(cid);
+}
+
+/* =========================================================================
+   감사 로그 (ADMIN / AUDITOR)
+   ========================================================================= */
+async function viewAuditLogs() {
+  const v = $("view");
+  v.innerHTML = `<h1 class="text-xl font-bold mb-4">감사 로그</h1>
+    <div id="audit-list" class="bg-white rounded-xl shadow-sm overflow-hidden">
+      <div class="p-8 text-center text-slate-400"><span class="inline-block w-5 h-5 border-2 border-slate-300 border-t-slate-600 rounded-full spin"></span></div>
+    </div>`;
+  const { data, error } = await sb.from("audit_logs").select("*").order("occurred_at", { ascending: false }).limit(200);
+  const box = $("audit-list");
+  if (error) { box.innerHTML = `<div class="p-6 text-red-600 text-sm">오류: ${esc(error.message)}</div>`; return; }
+  if (!data.length) { box.innerHTML = `<div class="p-10 text-center text-slate-400">기록이 없습니다.</div>`; return; }
+  box.innerHTML = `<table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-left">
+      <tr><th class="px-4 py-3 font-medium">시각</th><th class="px-4 py-3 font-medium">이벤트</th>
+      <th class="px-4 py-3 font-medium">대상</th><th class="px-4 py-3 font-medium">상세</th></tr>
+    </thead><tbody>
+    ${data.map((l) => `<tr class="border-t">
+      <td class="px-4 py-2 text-slate-500 whitespace-nowrap">${fmtDT(l.occurred_at)}</td>
+      <td class="px-4 py-2"><span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs">${esc(EVENT_LABEL[l.event_type] || l.event_type)}</span></td>
+      <td class="px-4 py-2 text-slate-600">${esc(RES_LABEL[l.resource_type] || l.resource_type || "—")}</td>
+      <td class="px-4 py-2 text-slate-400 text-xs">${l.extra_data ? esc(JSON.stringify(l.extra_data)) : "—"}</td>
+    </tr>`).join("")}
+    </tbody></table>`;
+}
+
+/* =========================================================================
+   시작
+   ========================================================================= */
+boot();
+</script>
+</body>
+</html>
