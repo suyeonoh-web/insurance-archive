@@ -53,6 +53,9 @@ const EVENT_LABEL = {
   MEMO_DELETE: "메모 삭제", FILE_UPLOAD: "문서 업로드", FILE_DOWNLOAD: "문서 열람",
 };
 const RES_LABEL = { customer: "고객", memo: "메모", file: "문서", user: "직원" };
+const APPT_STATUS = ["SCHEDULED", "DONE", "FOLLOWUP"];
+const APPT_STATUS_LABEL = { SCHEDULED: "예정", DONE: "완료", FOLLOWUP: "후속" };
+const APPT_STATUS_COLOR = { SCHEDULED: "bg-blue-100 text-blue-700", DONE: "bg-green-100 text-green-700", FOLLOWUP: "bg-amber-100 text-amber-700" };
 const PAGE_SIZE = 20;
 
 const state = {
@@ -214,6 +217,7 @@ function subscribeCustomer(id) {
   state.channel = sb.channel("cust-" + id)
     .on("postgres_changes", { event: "*", schema: "public", table: "memos", filter: "customer_id=eq." + id }, () => loadMemos(id))
     .on("postgres_changes", { event: "*", schema: "public", table: "contracts", filter: "customer_id=eq." + id }, () => loadContracts(id))
+    .on("postgres_changes", { event: "*", schema: "public", table: "appointments", filter: "customer_id=eq." + id }, () => loadCustomerAppts(id))
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "customers", filter: "id=eq." + id }, () => viewCustomerDetail(id, { silent: true }))
     .subscribe();
 }
@@ -286,7 +290,7 @@ function renderShell() {
         <div class="flex items-center gap-1">
           <span class="font-bold text-slate-800 mr-4">보험 고객 아카이브</span>
           <button data-nav="customers" class="nav-btn px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100">고객</button>
-          <button data-nav="files" class="nav-btn px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100">약관 PDF</button>
+          <button data-nav="schedule" class="nav-btn px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100">통화 일정</button>
           ${auditNav}
         </div>
         <div class="flex items-center gap-3 text-sm">
@@ -315,7 +319,7 @@ function navigate(name, arg) {
   unsubscribeCustomer();
   setActiveNav(name);
   if (name === "customers") viewCustomers();
-  else if (name === "files") viewFiles();
+  else if (name === "schedule") viewSchedule();
   else if (name === "audit") viewAuditLogs();
   else if (name === "customerDetail") viewCustomerDetail(arg);
 }
@@ -439,6 +443,13 @@ async function viewCustomerDetail(id, opts = {}) {
     </div>
     <div class="bg-white rounded-xl shadow-sm p-5 mt-4">
       <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-slate-700">통화 일정</h2>
+        ${canEdit() ? `<button id="add-cust-appt" class="text-xs px-2 py-1 rounded border hover:bg-slate-50">+ 통화 일정</button>` : ""}
+      </div>
+      <div id="cust-appts" class="text-sm text-slate-400">불러오는 중…</div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-5 mt-4">
+      <div class="flex items-center justify-between mb-3">
         <h2 class="font-semibold text-slate-700">고객 문서 (PDF)</h2>
         ${canEdit() ? `<button id="add-cfile" class="text-xs px-2 py-1 rounded border hover:bg-slate-50">+ PDF 업로드</button>` : ""}
       </div>
@@ -456,10 +467,12 @@ async function viewCustomerDetail(id, opts = {}) {
     $("add-contract").addEventListener("click", () => openContractForm(id));
     $("add-memo").addEventListener("click", () => openMemoForm(id));
     $("add-cfile").addEventListener("click", () => openCustomerFileForm(id));
+    $("add-cust-appt").addEventListener("click", () => openApptForm(id));
   }
   if (isAdmin()) $("del-cust").addEventListener("click", () => softDeleteCustomer(c));
   loadContracts(id);
   loadMemos(id);
+  loadCustomerAppts(id);
   loadCustomerFiles(id);
   if (!opts.silent) subscribeCustomer(id);
 }
@@ -877,6 +890,195 @@ async function uploadCustomerFile(e, cid, getFile) {
   if (error) { await sb.storage.from("insurance-pdfs").remove([key]); return err("정보 저장 실패: " + error.message); }
   await logAudit("FILE_UPLOAD", "file", data.id, { filename: file.name, customer_id: cid });
   closeModal(); toast("업로드되었습니다."); loadCustomerFiles(cid);
+}
+
+/* =========================================================================
+   통화 일정 (캘린더 / 칸반)
+   ========================================================================= */
+function fmtTime(d) { return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); }
+function fmtMD(iso) {
+  return new Date(iso).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+function toLocalInput(iso) {
+  const d = new Date(iso), p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function viewSchedule() {
+  if (!state.calMonth) state.calMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  if (!state.scheduleView) state.scheduleView = "calendar";
+  $("view").innerHTML = `
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+      <h1 class="text-xl font-bold">통화 일정</h1>
+      <div class="flex items-center gap-2">
+        <div class="inline-flex rounded-lg border overflow-hidden text-sm">
+          <button id="tg-cal" class="px-4 py-2">📅 캘린더</button>
+          <button id="tg-kan" class="px-4 py-2 border-l">📋 칸반</button>
+        </div>
+        <button id="add-appt" class="bg-slate-800 text-white text-sm px-4 py-2 rounded-lg hover:bg-slate-700">+ 일정 추가</button>
+      </div>
+    </div>
+    <div id="sched-body"></div>`;
+  $("tg-cal").addEventListener("click", () => { state.scheduleView = "calendar"; renderScheduleToggle(); loadSchedule(); });
+  $("tg-kan").addEventListener("click", () => { state.scheduleView = "kanban"; renderScheduleToggle(); loadSchedule(); });
+  $("add-appt").addEventListener("click", () => openApptForm());
+  renderScheduleToggle();
+  loadSchedule();
+  subscribeSchedule();
+}
+
+function renderScheduleToggle() {
+  const cal = state.scheduleView === "calendar";
+  $("tg-cal").className = "px-4 py-2 " + (cal ? "bg-slate-800 text-white" : "bg-white text-slate-600");
+  $("tg-kan").className = "px-4 py-2 border-l " + (!cal ? "bg-slate-800 text-white" : "bg-white text-slate-600");
+}
+
+function loadSchedule() {
+  return state.scheduleView === "calendar" ? loadCalendar() : loadKanban();
+}
+
+function subscribeSchedule() {
+  if (state.channel) { sb.removeChannel(state.channel); state.channel = null; }
+  state.channel = sb.channel("appointments-all")
+    .on("postgres_changes", { event: "*", schema: "public", table: "appointments" }, () => loadSchedule())
+    .subscribe();
+}
+
+async function loadCalendar() {
+  const y = state.calMonth.getFullYear(), m = state.calMonth.getMonth();
+  const start = new Date(y, m, 1).toISOString(), end = new Date(y, m + 1, 1).toISOString();
+  const { data } = await sb.from("appointments").select("*, customers(name)")
+    .gte("scheduled_at", start).lt("scheduled_at", end).order("scheduled_at");
+  const byDay = {};
+  (data || []).forEach((a) => { const d = new Date(a.scheduled_at); (byDay[d.getDate()] ||= []).push(a); });
+  const startDay = new Date(y, m, 1).getDay();
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const head = ["일", "월", "화", "수", "목", "금", "토"]
+    .map((w) => `<div class="text-center text-xs font-medium text-slate-400 py-1">${w}</div>`).join("");
+  let cells = "";
+  for (let i = 0; i < startDay; i++) cells += `<div class="min-h-24 border rounded-lg bg-slate-50"></div>`;
+  for (let day = 1; day <= daysInMonth; day++) {
+    const chips = (byDay[day] || []).map((a) => `
+      <div class="appt-chip text-xs px-1.5 py-0.5 rounded mb-1 cursor-pointer truncate ${APPT_STATUS_COLOR[a.status]}" data-cust="${a.customer_id}" title="${esc((a.customers && a.customers.name) || "")} ${esc(a.title || "")}">
+        ${fmtTime(new Date(a.scheduled_at))} ${esc((a.customers && a.customers.name) || "고객")}
+      </div>`).join("");
+    cells += `<div class="min-h-24 border rounded-lg p-1"><div class="text-xs text-slate-500 mb-1">${day}</div>${chips}</div>`;
+  }
+  $("sched-body").innerHTML = `
+    <div class="flex items-center justify-center gap-4 mb-3">
+      <button id="cal-prev" class="px-3 py-1 rounded border hover:bg-slate-100">‹ 이전달</button>
+      <span class="font-bold text-lg">${y}년 ${m + 1}월</span>
+      <button id="cal-next" class="px-3 py-1 rounded border hover:bg-slate-100">다음달 ›</button>
+    </div>
+    <div class="grid grid-cols-7 gap-1">${head}</div>
+    <div class="grid grid-cols-7 gap-1 mt-1">${cells}</div>`;
+  $("cal-prev").addEventListener("click", () => { state.calMonth = new Date(y, m - 1, 1); loadCalendar(); });
+  $("cal-next").addEventListener("click", () => { state.calMonth = new Date(y, m + 1, 1); loadCalendar(); });
+  $("sched-body").querySelectorAll(".appt-chip").forEach((el) =>
+    el.addEventListener("click", () => navigate("customerDetail", el.dataset.cust)));
+}
+
+async function loadKanban() {
+  const { data } = await sb.from("appointments").select("*, customers(name)").order("scheduled_at");
+  const appts = data || [];
+  const cols = APPT_STATUS.map((st) => {
+    const items = appts.filter((a) => a.status === st).map((a) => `
+      <div class="appt-card bg-white border rounded-lg p-3 mb-2 cursor-pointer" draggable="true" data-id="${a.id}" data-cust="${a.customer_id}">
+        <div class="font-medium text-slate-800">${esc((a.customers && a.customers.name) || "고객")}</div>
+        <div class="text-xs text-slate-500 mt-0.5">${fmtMD(a.scheduled_at)}</div>
+        ${a.title ? `<div class="text-xs text-slate-600 mt-1">${esc(a.title)}</div>` : ""}
+      </div>`).join("");
+    return `<div class="flex-1 min-w-56 bg-slate-100 rounded-xl p-3">
+      <div class="font-semibold text-sm mb-2">${APPT_STATUS_LABEL[st]} <span class="text-slate-400">(${appts.filter((a) => a.status === st).length})</span></div>
+      <div class="kan-drop min-h-32" data-col="${st}">${items || '<p class="text-xs text-slate-400">없음</p>'}</div>
+    </div>`;
+  }).join("");
+  $("sched-body").innerHTML = `<div class="flex gap-3 overflow-x-auto pb-2">${cols}</div>`;
+  $("sched-body").querySelectorAll(".appt-card").forEach((el) => {
+    el.addEventListener("click", () => navigate("customerDetail", el.dataset.cust));
+    el.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/plain", el.dataset.id));
+  });
+  $("sched-body").querySelectorAll(".kan-drop").forEach((zone) => {
+    zone.addEventListener("dragover", (e) => e.preventDefault());
+    zone.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      const id = e.dataTransfer.getData("text/plain");
+      await sb.from("appointments").update({ status: zone.dataset.col }).eq("id", id);
+      loadKanban();
+    });
+  });
+}
+
+async function openApptForm(presetCustomerId = null, appt = null) {
+  const { data: custs } = await sb.from("customers").select("id,name").is("deleted_at", null).order("name");
+  const sel = appt ? appt.customer_id : presetCustomerId;
+  const options = (custs || []).map((c) => `<option value="${c.id}" ${sel === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("");
+  openModal(`
+    <form id="appt-form" class="p-6">
+      <h2 class="text-lg font-bold mb-4">${appt ? "통화 일정 수정" : "통화 일정 추가"}</h2>
+      <div class="space-y-3 text-sm">
+        ${field("고객*", `<select name="customer" required class="${inp}">${options}</select>`)}
+        ${field("일시*", `<input name="when" type="datetime-local" required value="${appt ? toLocalInput(appt.scheduled_at) : ""}" class="${inp}">`)}
+        ${field("제목", `<input name="title" value="${esc(appt?.title || "")}" placeholder="예: 보장 점검 통화" class="${inp}">`)}
+        ${field("상태", `<select name="status" class="${inp}">${APPT_STATUS.map((s) => `<option value="${s}" ${appt?.status === s ? "selected" : ""}>${APPT_STATUS_LABEL[s]}</option>`).join("")}</select>`)}
+        ${field("메모", `<textarea name="note" rows="2" class="${inp}">${esc(appt?.note || "")}</textarea>`)}
+      </div>
+      <p id="appt-err" class="text-red-600 text-sm mt-3 hidden"></p>
+      <div class="flex justify-between items-center mt-5">
+        <div>${appt ? `<button type="button" id="appt-del" class="text-red-500 text-sm">삭제</button>` : ""}</div>
+        <div class="flex gap-2">
+          <button type="button" id="appt-cancel" class="px-4 py-2 rounded-lg border text-sm hover:bg-slate-50">취소</button>
+          <button type="submit" id="appt-save" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700">저장</button>
+        </div>
+      </div>
+    </form>`);
+  $("appt-cancel").addEventListener("click", closeModal);
+  if (appt) $("appt-del").addEventListener("click", () => deleteAppt(appt.id));
+  $("appt-form").addEventListener("submit", (e) => saveAppt(e, appt));
+}
+
+async function saveAppt(e, appt) {
+  e.preventDefault();
+  const f = e.target, btn = $("appt-save");
+  const err = (m) => { $("appt-err").textContent = m; $("appt-err").classList.remove("hidden"); btn.disabled = false; btn.textContent = "저장"; };
+  const cid = f.customer.value, when = f.when.value;
+  if (!cid) return err("고객을 선택하세요.");
+  if (!when) return err("일시를 입력하세요.");
+  btn.disabled = true; btn.textContent = "저장 중…";
+  const payload = {
+    customer_id: cid, scheduled_at: new Date(when).toISOString(),
+    title: f.title.value.trim() || null, status: f.status.value, note: f.note.value.trim() || null,
+  };
+  let res;
+  if (appt) res = await sb.from("appointments").update(payload).eq("id", appt.id);
+  else { payload.created_by = state.user.id; res = await sb.from("appointments").insert(payload); }
+  if (res.error) return err("저장 실패: " + res.error.message);
+  closeModal(); toast("저장되었습니다.");
+  if ($("sched-body")) loadSchedule();
+  if ($("cust-appts")) loadCustomerAppts(cid);
+}
+
+async function deleteAppt(id) {
+  if (!confirm("이 통화 일정을 삭제할까요?")) return;
+  const { error } = await sb.from("appointments").delete().eq("id", id);
+  if (error) { toast("삭제 실패: " + error.message, "err"); return; }
+  closeModal(); toast("삭제되었습니다.");
+  if ($("sched-body")) loadSchedule();
+}
+
+async function loadCustomerAppts(cid) {
+  const box = $("cust-appts");
+  if (!box) return;
+  const { data } = await sb.from("appointments").select("*").eq("customer_id", cid).order("scheduled_at", { ascending: false });
+  if (!data || !data.length) { box.innerHTML = `<p class="text-slate-400">통화 일정이 없습니다.</p>`; return; }
+  box.innerHTML = data.map((a) => `
+    <div class="appt-row flex items-center gap-2 border rounded-lg p-2 mb-2 cursor-pointer hover:bg-slate-50" data-id="${a.id}">
+      <span class="text-xs px-2 py-0.5 rounded-full ${APPT_STATUS_COLOR[a.status]}">${APPT_STATUS_LABEL[a.status]}</span>
+      <span class="text-slate-700">${fmtMD(a.scheduled_at)}</span>
+      ${a.title ? `<span class="text-slate-500 text-sm">${esc(a.title)}</span>` : ""}
+    </div>`).join("");
+  box.querySelectorAll(".appt-row").forEach((el) =>
+    el.addEventListener("click", () => openApptForm(cid, data.find((x) => x.id === el.dataset.id))));
 }
 
 /* =========================================================================
